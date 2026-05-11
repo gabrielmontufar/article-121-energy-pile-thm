@@ -1,0 +1,38 @@
+{
+  "model": "reduced-order 1D finite-element-equivalent THM screening benchmark",
+  "scenarios": [
+    "Building core foundation",
+    "Bridge abutment retrofit",
+    "Equipment-supported mat"
+  ],
+  "outputs": {
+    "figures": [
+      "Figures\\Figure_1_civil_infrastructure_THM_framework.png",
+      "Figures\\Figure_2_THM_time_histories.png",
+      "Figures\\Figure_3_settlement_model_comparison.png",
+      "Figures\\Figure_4_sensitivity_ranking.png",
+      "Figures\\Figure_5_serviceability_envelope.png",
+      "Figures\\Figure_6_convergence_check.png"
+    ],
+    "table_images": [
+      "Table images\\Table_1_layer_parameters.png",
+      "Table images\\Table_2_civil_infrastructure_scenarios.png",
+      "Table images\\Table_3_model_comparison_results.png",
+      "Table images\\Table_4_sensitivity_ranking.png"
+    ],
+    "supplementary_data": [
+      "Supplementary data\\bridge_abutment_retrofit_time_history.csv",
+      "Supplementary data\\building_core_foundation_time_history.csv",
+      "Supplementary data\\convergence_check.csv",
+      "Supplementary data\\equipment-supported_mat_time_history.csv",
+      "Supplementary data\\layer_parameters_and_state_summary.csv",
+      "Supplementary data\\scenario_summary.csv",
+      "Supplementary data\\sensitivity_results.csv"
+    ]
+  },
+  "limitations": [
+    "screening benchmark, not a calibrated site-specific design model",
+    "axisymmetric pile-soil heat transfer is represented by depth-layered reduced-order states",
+    "cyclic settlement is an index calibrated for transparent sensitivity, not a universal empirical law"
+  ]
+}
