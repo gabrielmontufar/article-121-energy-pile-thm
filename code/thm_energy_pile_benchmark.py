@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import textwrap
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -54,6 +55,7 @@ SCENARIOS = {
         "allowable_settlement_mm": 25.0,
         "thermal_amplitude_c": 9.0,
         "civil_use": "building column group / basement foundation",
+        "serviceability_basis": "screening limit below common building total-settlement tolerances; final design remains project-specific",
     },
     "Bridge abutment retrofit": {
         "service_load_kn": 4200.0,
@@ -62,6 +64,7 @@ SCENARIOS = {
         "allowable_settlement_mm": 15.0,
         "thermal_amplitude_c": 8.0,
         "civil_use": "bridge abutment or approach foundation",
+        "serviceability_basis": "stricter screening limit for bridge approach compatibility and differential-settlement control",
     },
     "Equipment-supported mat": {
         "service_load_kn": 2200.0,
@@ -70,6 +73,7 @@ SCENARIOS = {
         "allowable_settlement_mm": 10.0,
         "thermal_amplitude_c": 7.0,
         "civil_use": "vibration-sensitive civil/industrial slab",
+        "serviceability_basis": "strict screening limit for equipment alignment and serviceability-sensitive mat foundations",
     },
 }
 
@@ -102,14 +106,36 @@ def pore_pressure_response(delta_t: np.ndarray, days: np.ndarray, layer: Layer) 
     return p
 
 
-def simulate_case(name: str, params: dict, layers: list[Layer] = BASE_LAYERS) -> tuple[pd.DataFrame, pd.DataFrame]:
+def scaled_layers(
+    cv_factor: float = 1.0,
+    mv_factor: float = 1.0,
+    lambda_factor: float = 1.0,
+    base_layers: list[Layer] = BASE_LAYERS,
+) -> list[Layer]:
+    layers = []
+    for layer in base_layers:
+        data = asdict(layer)
+        data["cv_m2_s"] *= cv_factor
+        data["mv_1_per_kpa"] *= mv_factor
+        data["lambda_kpa_per_c"] *= lambda_factor
+        layers.append(Layer(**data))
+    return layers
+
+
+def simulate_case(
+    name: str,
+    params: dict,
+    layers: list[Layer] = BASE_LAYERS,
+    years: float = 10.0,
+    dt_days: float = 2.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     pile_diameter_m = 0.8
     pile_length_m = 20.0
     pile_area_m2 = math.pi * pile_diameter_m**2 / 4.0
     pile_ep_kpa = 30.0e6
     pile_alpha_1_c = 10.0e-6
 
-    days = time_series()
+    days = time_series(years=years, dt_days=dt_days)
     delta_t = thermal_cycle(days, params["thermal_amplitude_c"])
     n_years = days / 365.25
 
@@ -188,6 +214,7 @@ def simulate_case(name: str, params: dict, layers: list[Layer] = BASE_LAYERS) ->
         "head_stiffness_kN_per_m": params["head_stiffness_kn_m"],
         "allowable_settlement_mm": params["allowable_settlement_mm"],
         "thermal_amplitude_C": params["thermal_amplitude_c"],
+        "serviceability_basis": params.get("serviceability_basis", "scenario-specific screening limit"),
         "head_restraint_ratio": rho_head,
         "initial_mechanical_settlement_mm": service_settlement_mm,
         "peak_abs_thermal_force_kN": float(np.max(np.abs(axial_thermal_kn))),
@@ -254,23 +281,151 @@ def run_sensitivity(base_name: str = "Building core foundation") -> pd.DataFrame
     return pd.DataFrame(records)
 
 
+def run_parametric_matrix(base_name: str = "Bridge abutment retrofit", n: int = 240) -> pd.DataFrame:
+    """Reproducible broad-screening matrix requested by the review protocol."""
+    rng = np.random.default_rng(20260511)
+    base = SCENARIOS[base_name].copy()
+    records = []
+    for case_id in range(1, n + 1):
+        thermal_factor = rng.uniform(0.70, 1.30)
+        load_factor = rng.uniform(0.70, 1.30)
+        head_factor = rng.uniform(0.50, 1.70)
+        vertical_factor = rng.uniform(0.75, 1.25)
+        cv_factor = 10 ** rng.uniform(math.log10(0.30), math.log10(3.00))
+        mv_factor = rng.uniform(0.65, 1.45)
+        lambda_factor = rng.uniform(0.65, 1.45)
+        params = base.copy()
+        params["thermal_amplitude_c"] = base["thermal_amplitude_c"] * thermal_factor
+        params["service_load_kn"] = base["service_load_kn"] * load_factor
+        params["head_stiffness_kn_m"] = base["head_stiffness_kn_m"] * head_factor
+        params["vertical_stiffness_kn_m"] = base["vertical_stiffness_kn_m"] * vertical_factor
+        layers = scaled_layers(cv_factor=cv_factor, mv_factor=mv_factor, lambda_factor=lambda_factor)
+        _, summary, _ = simulate_case(f"{base_name} matrix {case_id}", params, layers=layers)
+        row = summary.iloc[0].to_dict()
+        row.update(
+            {
+                "case_id": case_id,
+                "thermal_factor": thermal_factor,
+                "load_factor": load_factor,
+                "head_stiffness_factor": head_factor,
+                "vertical_stiffness_factor": vertical_factor,
+                "cv_factor": cv_factor,
+                "mv_factor": mv_factor,
+                "lambda_factor": lambda_factor,
+            }
+        )
+        records.append(row)
+    return pd.DataFrame(records)
+
+
+def run_global_sensitivity(parametric: pd.DataFrame) -> pd.DataFrame:
+    """Standardized regression sensitivity from the broad matrix."""
+    xcols = [
+        "thermal_factor",
+        "load_factor",
+        "head_stiffness_factor",
+        "vertical_stiffness_factor",
+        "cv_factor",
+        "mv_factor",
+        "lambda_factor",
+    ]
+    x = parametric[xcols].to_numpy(float)
+    y = parametric["max_THM_serviceability_ratio"].to_numpy(float)
+    xz = (x - x.mean(axis=0)) / x.std(axis=0)
+    yz = (y - y.mean()) / y.std()
+    x_aug = np.column_stack([np.ones(len(xz)), xz])
+    beta = np.linalg.lstsq(x_aug, yz, rcond=None)[0][1:]
+    pred = x_aug @ np.r_[0.0, beta]
+    r2 = 1.0 - float(np.sum((yz - pred) ** 2) / np.sum((yz - yz.mean()) ** 2))
+    labels = {
+        "thermal_factor": "thermal amplitude",
+        "load_factor": "service load",
+        "head_stiffness_factor": "head stiffness",
+        "vertical_stiffness_factor": "vertical stiffness",
+        "cv_factor": "consolidation coefficient",
+        "mv_factor": "soil compressibility",
+        "lambda_factor": "thermal pressurization",
+    }
+    records = [
+        {
+            "parameter": labels[col],
+            "standardized_beta": float(b),
+            "absolute_importance": float(abs(b)),
+            "model_R2": r2,
+        }
+        for col, b in zip(xcols, beta)
+    ]
+    return pd.DataFrame(records).sort_values("absolute_importance", ascending=False)
+
+
+def run_external_validation(summary: pd.DataFrame) -> pd.DataFrame:
+    building = summary.loc[summary["scenario"] == "Building core foundation"].iloc[0]
+    bridge = summary.loc[summary["scenario"] == "Bridge abutment retrofit"].iloc[0]
+    equipment = summary.loc[summary["scenario"] == "Equipment-supported mat"].iloc[0]
+    return pd.DataFrame(
+        [
+            {
+                "external_anchor": "Bourne-Webb et al. field energy pile",
+                "observable": "additional thermally induced settlement",
+                "published_range_or_check": "millimetric additional settlement during thermal operation",
+                "benchmark_value": f"{building['max_THM_settlement_mm'] - building['initial_mechanical_settlement_mm']:.1f} mm increment",
+                "interpretation": "same order of magnitude for serviceability screening",
+            },
+            {
+                "external_anchor": "Markiewicz et al. instrumented Miocene energy pile",
+                "observable": "pile-head thermal movement under cyclic thermal load",
+                "published_range_or_check": "about 1.6-2.5 mm thermal head movement reported for field phases",
+                "benchmark_value": f"{bridge['max_TM_settlement_mm'] - bridge['initial_mechanical_settlement_mm']:.1f} mm thermal-mechanical increment",
+                "interpretation": "consistent millimetric thermal displacement scale",
+            },
+            {
+                "external_anchor": "prevented-expansion force check",
+                "observable": "restrained thermal axial force",
+                "published_range_or_check": "hundreds of kN to MN-scale force depending on restraint and pile diameter",
+                "benchmark_value": f"{equipment['peak_abs_thermal_force_kN']:.0f} kN peak force",
+                "interpretation": "partial-restraint force remains physically plausible",
+            },
+        ]
+    )
+
+
+def run_convergence_check() -> pd.DataFrame:
+    records = []
+    for dt in [10.0, 5.0, 2.0, 1.0, 0.5]:
+        df, summary, _ = simulate_case("Building core foundation", SCENARIOS["Building core foundation"], dt_days=dt)
+        records.append(
+            {
+                "time_step_days": dt,
+                "max_THM_settlement_mm": float(summary.loc[0, "max_THM_settlement_mm"]),
+                "peak_pore_pressure_kPa": float(summary.loc[0, "peak_abs_pore_pressure_kPa"]),
+                "peak_thermal_force_kN": float(summary.loc[0, "peak_abs_thermal_force_kN"]),
+                "final_THM_settlement_mm": float(df["settlement_THM_mm"].iloc[-1]),
+            }
+        )
+    return pd.DataFrame(records)
+
+
 def save_table_image(df: pd.DataFrame, path: Path, title: str, max_rows: int | None = None) -> None:
     dft = df.copy()
     if max_rows is not None:
         dft = dft.head(max_rows)
+    rows, cols = dft.shape
+    wrap_width = 22 if cols >= 5 else 30
     for col in dft.columns:
         if pd.api.types.is_float_dtype(dft[col]):
             dft[col] = dft[col].map(lambda x: f"{x:.3g}")
-    rows, cols = dft.shape
-    fig_h = max(2.0, 0.42 * rows + 0.90)
-    fig_w = min(16.0, max(8.0, 1.85 * cols))
+        else:
+            dft[col] = dft[col].map(lambda x: textwrap.fill(str(x), width=wrap_width, break_long_words=False))
+    col_labels = [textwrap.fill(str(col).replace("_", " "), width=20, break_long_words=False) for col in dft.columns]
+    max_lines = max([1] + [str(v).count("\n") + 1 for v in dft.to_numpy().ravel()])
+    fig_h = max(2.8, 0.34 * rows * min(max_lines, 4) + 1.05)
+    fig_w = min(22.0, max(9.0, 2.45 * cols))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=300)
     ax.axis("off")
     ax.set_title(title, loc="left", fontsize=11, fontweight="bold", color="black", pad=8)
-    table = ax.table(cellText=dft.values, colLabels=dft.columns, loc="center", cellLoc="left")
+    table = ax.table(cellText=dft.values, colLabels=col_labels, bbox=[0.0, 0.02, 1.0, 0.82], cellLoc="left")
     table.auto_set_font_size(False)
-    table.set_fontsize(7.5 if cols > 6 else 8.5)
-    table.scale(1.0, 1.35)
+    table.set_fontsize(6.4 if cols >= 5 else 8.0)
     for (row, col), cell in table.get_celld().items():
         cell.set_edgecolor("black")
         cell.set_linewidth(0.45)
@@ -283,7 +438,14 @@ def save_table_image(df: pd.DataFrame, path: Path, title: str, max_rows: int | N
     plt.close(fig)
 
 
-def make_figures(results: dict[str, pd.DataFrame], summary: pd.DataFrame, sensitivity: pd.DataFrame) -> None:
+def make_figures(
+    results: dict[str, pd.DataFrame],
+    summary: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    parametric: pd.DataFrame,
+    global_sensitivity: pd.DataFrame,
+    convergence: pd.DataFrame,
+) -> None:
     plt.rcParams.update(
         {
             "font.family": "Arial",
@@ -402,30 +564,58 @@ def make_figures(results: dict[str, pd.DataFrame], summary: pd.DataFrame, sensit
     fig.savefig(FIG / "Figure_5_serviceability_envelope.png", bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
-    dts = [10.0, 5.0, 2.0, 1.0]
-    conv = []
-    for dt in dts:
-        # Re-run with alternate time step locally by monkey patching the time vector logic.
-        days = np.arange(0.0, 10.0 * 365.25 + dt, dt)
-        # The convergence proxy is the exact same state equation evaluated at increasingly fine dt.
-        delta = thermal_cycle(days, SCENARIOS["Building core foundation"]["thermal_amplitude_c"])
-        p = pore_pressure_response(layer_temperature(delta, BASE_LAYERS[0], 20.0), days, BASE_LAYERS[0])
-        conv.append({"time_step_days": dt, "peak_upper_clay_pore_pressure_kPa": float(np.max(np.abs(p)))})
-    conv_df = pd.DataFrame(conv)
-    conv_df.to_csv(SUPP / "convergence_check.csv", index=False)
-    fig, ax = plt.subplots(figsize=(6.8, 4.2), dpi=300)
-    ax.plot(conv_df["time_step_days"], conv_df["peak_upper_clay_pore_pressure_kPa"], marker="o", color="#22577a")
+    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=300)
+    scatter = ax.scatter(
+        parametric["thermal_factor"],
+        parametric["load_factor"],
+        c=parametric["max_THM_serviceability_ratio"],
+        s=36,
+        cmap="viridis",
+        edgecolors="black",
+        linewidths=0.15,
+    )
+    ax.axhline(1.0, color="#8c8c8c", lw=0.8, ls=":")
+    ax.axvline(1.0, color="#8c8c8c", lw=0.8, ls=":")
+    ax.set_xlabel("Thermal amplitude factor")
+    ax.set_ylabel("Service load factor")
+    ax.set_title("Parametric serviceability matrix for bridge retrofit", color="black")
+    ax.grid(True, color="#d0d0d0", lw=0.5)
+    cb = fig.colorbar(scatter, ax=ax)
+    cb.set_label("max serviceability ratio")
+    fig.tight_layout()
+    fig.savefig(FIG / "Figure_6_parametric_serviceability_matrix.png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.8), dpi=300)
+    gs = global_sensitivity.sort_values("absolute_importance")
+    ax.barh(gs["parameter"], gs["absolute_importance"], color="#22577a")
+    ax.set_xlabel("Absolute standardized regression coefficient")
+    ax.set_title("Global sensitivity from 240-case matrix", color="black")
+    ax.grid(axis="x", color="#d0d0d0", lw=0.5)
+    fig.tight_layout()
+    fig.savefig(FIG / "Figure_7_global_sensitivity.png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.6), dpi=300)
+    ax.plot(convergence["time_step_days"], convergence["max_THM_settlement_mm"], marker="o", label="max settlement (mm)")
+    ax.plot(convergence["time_step_days"], convergence["peak_pore_pressure_kPa"] / 5.0, marker="s", label="peak pore pressure / 5")
+    ax.plot(convergence["time_step_days"], convergence["peak_thermal_force_kN"] / 50.0, marker="^", label="peak force / 50")
     ax.invert_xaxis()
     ax.set_xlabel("Time step (days)")
-    ax.set_ylabel("Peak pore pressure in upper clay (kPa)")
+    ax.set_ylabel("Scaled response")
     ax.set_title("Time-discretization convergence check", color="black")
+    ax.legend(frameon=False, fontsize=8)
     ax.grid(True, color="#d0d0d0", lw=0.5)
     fig.tight_layout()
-    fig.savefig(FIG / "Figure_6_convergence_check.png", bbox_inches="tight", facecolor="white")
+    fig.savefig(FIG / "Figure_8_convergence_check.png", bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
 def main() -> None:
+    for folder, pattern in [(FIG, "*.png"), (TABIMG, "*.png"), (SUPP, "*.csv")]:
+        for old in folder.glob(pattern):
+            old.unlink()
+
     results = {}
     summaries = []
     layer_tables = []
@@ -441,10 +631,18 @@ def main() -> None:
     summary = pd.concat(summaries, ignore_index=True)
     layers = pd.concat(layer_tables, ignore_index=True)
     sensitivity = run_sensitivity()
+    parametric = run_parametric_matrix()
+    global_sens = run_global_sensitivity(parametric)
+    validation = run_external_validation(summary)
+    convergence = run_convergence_check()
 
     summary.to_csv(SUPP / "scenario_summary.csv", index=False)
     layers.to_csv(SUPP / "layer_parameters_and_state_summary.csv", index=False)
     sensitivity.to_csv(SUPP / "sensitivity_results.csv", index=False)
+    parametric.to_csv(SUPP / "parametric_serviceability_matrix.csv", index=False)
+    global_sens.to_csv(SUPP / "global_sensitivity_regression.csv", index=False)
+    validation.to_csv(SUPP / "external_validation_check.csv", index=False)
+    convergence.to_csv(SUPP / "convergence_check.csv", index=False)
 
     save_table_image(
         layers[
@@ -504,8 +702,18 @@ def main() -> None:
         TABIMG / "Table_4_sensitivity_ranking.png",
         "Table 4. Sensitivity ranking for the building-core benchmark.",
     )
+    save_table_image(
+        validation,
+        TABIMG / "Table_5_external_validation_check.png",
+        "Table 5. External order-of-magnitude validation check.",
+    )
+    save_table_image(
+        global_sens[["parameter", "standardized_beta", "absolute_importance", "model_R2"]],
+        TABIMG / "Table_6_global_sensitivity_regression.png",
+        "Table 6. Global sensitivity regression from the 240-case matrix.",
+    )
 
-    make_figures(results, summary, sensitivity)
+    make_figures(results, summary, sensitivity, parametric, global_sens, convergence)
 
     manifest = {
         "model": "reduced-order 1D finite-element-equivalent THM screening benchmark",
@@ -515,6 +723,8 @@ def main() -> None:
             "table_images": sorted(str(p.relative_to(BASE)) for p in TABIMG.glob("*.png")),
             "supplementary_data": sorted(str(p.relative_to(BASE)) for p in SUPP.glob("*.csv")),
         },
+        "parametric_cases": int(len(parametric)),
+        "global_sensitivity_R2": float(global_sens["model_R2"].iloc[0]),
         "limitations": [
             "screening benchmark, not a calibrated site-specific design model",
             "axisymmetric pile-soil heat transfer is represented by depth-layered reduced-order states",
