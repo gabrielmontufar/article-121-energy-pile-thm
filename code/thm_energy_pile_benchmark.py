@@ -590,7 +590,7 @@ def make_figures(
     gs = global_sensitivity.sort_values("absolute_importance")
     ax.barh(gs["parameter"], gs["absolute_importance"], color="#22577a")
     ax.set_xlabel("Absolute standardized regression coefficient")
-    ax.set_title("Global sensitivity from 240-case matrix", color="black")
+    ax.set_title("Regression-based sensitivity from 240-case matrix", color="black")
     ax.grid(axis="x", color="#d0d0d0", lw=0.5)
     fig.tight_layout()
     fig.savefig(FIG / "Figure_7_global_sensitivity.png", bbox_inches="tight", facecolor="white")
@@ -710,7 +710,7 @@ def main() -> None:
     save_table_image(
         global_sens[["parameter", "standardized_beta", "absolute_importance", "model_R2"]],
         TABIMG / "Table_6_global_sensitivity_regression.png",
-        "Table 6. Global sensitivity regression from the 240-case matrix.",
+        "Table 6. Standardized regression-based sensitivity from the 240-case matrix.",
     )
 
     make_figures(results, summary, sensitivity, parametric, global_sens, convergence)
